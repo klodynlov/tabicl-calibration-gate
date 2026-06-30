@@ -1,0 +1,5 @@
+numpy
+scikit-learn>=1.3
+pandas
+# optional: enables the TabICL candidate model
+# tabicl
