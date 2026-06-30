@@ -31,9 +31,11 @@ Lower ECE = the displayed confidence matches the real accuracy. That makes the c
 ## Install
 
 ```bash
-pip install numpy scikit-learn pandas
+pip install numpy "scikit-learn>=1.3" pandas
 pip install tabicl   # optional — enables the TabICL candidate model
 ```
+
+Python 3.10+. Feature columns must be numeric (encode categoricals first); the gate fails loud with a clear message otherwise.
 
 ## Usage
 
@@ -76,11 +78,13 @@ reliability curve (confidence vs accuracy per bin):
 
 ## In CI
 
-The process exits `1` if the candidate fails the gate, `0` otherwise:
+The process exits `1` if the candidate (TabICL) fails the gate, `0` otherwise:
 
 ```yaml
 - run: python calibration_gate.py --dataset breast_cancer --gate-metric f1_weighted --epsilon 0.0
 ```
+
+> If TabICL is **not** installed, the gate prints baseline-only and exits `0` (no verdict) — a CI job would pass green with no gate ever applied. Install `tabicl` in CI if you want the gate enforced.
 
 ## Options
 
@@ -92,7 +96,9 @@ The process exits `1` if the candidate fails the gate, `0` otherwise:
 | `--gate-metric` | `f1_macro` | metric the PASS/FAIL is decided on |
 | `--epsilon` | `0.0` | tolerance: candidate must be `>= baseline - epsilon` |
 | `--calibration` | off | print ECE + reliability curve |
+| `--n-estimators` | `8` | TabICL ensemble size |
 | `--device` | auto | TabICL device (`mps`, `cpu`) |
+| `--random-state` | `42` | seed for reproducibility |
 
 ## Background
 

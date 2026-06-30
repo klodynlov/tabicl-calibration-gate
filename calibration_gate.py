@@ -57,12 +57,12 @@ def load_dataset(args) -> tuple[pd.DataFrame, pd.Series]:
     if args.csv:
         df = pd.read_csv(args.csv)
         if args.target not in df.columns:
-            sys.exit(f"--target '{args.target}' absent du CSV (colonnes: {list(df.columns)})")
+            sys.exit(f"--target '{args.target}' not found in CSV (columns: {list(df.columns)})")
         y = df[args.target]
         X = df.drop(columns=[args.target])
         return X, y
     if args.dataset not in SKLEARN_DATASETS:
-        sys.exit(f"--dataset inconnu. Choix: {', '.join(SKLEARN_DATASETS)} (ou utilise --csv)")
+        sys.exit(f"--dataset unknown. Choose from: {', '.join(SKLEARN_DATASETS)} (or use --csv)")
     import sklearn.datasets as ds
 
     data = getattr(ds, SKLEARN_DATASETS[args.dataset])()
@@ -71,8 +71,24 @@ def load_dataset(args) -> tuple[pd.DataFrame, pd.Series]:
     return X, y
 
 
-def make_features(X: pd.DataFrame, n_pca: int) -> Pipeline | str:
-    """Optional PCA when the feature count is large (e.g. embeddings); else passthrough."""
+def validate_inputs(X: pd.DataFrame, y: pd.Series) -> None:
+    """Fail loud with a clear message on inputs the gate cannot handle."""
+    non_numeric = X.select_dtypes(exclude="number").columns.tolist()
+    if non_numeric:
+        sys.exit(f"non-numeric feature column(s): {non_numeric}. "
+                 "Encode them (e.g. OrdinalEncoder / one-hot) before running the gate.")
+    if y.isna().any():
+        sys.exit(f"target contains {int(y.isna().sum())} missing value(s); drop or impute them first.")
+    if y.nunique() < 2:
+        sys.exit(f"target has a single class ({y.unique().tolist()}); need >= 2 for classification.")
+    n_nan = int(pd.isna(X.to_numpy()).sum())
+    if n_nan:
+        print(f"[warn] X contains {n_nan} NaN(s): HistGradientBoosting handles them natively, "
+              "but PCA (if triggered) and some models do not.\n")
+
+
+def make_features(X: pd.DataFrame, n_pca: int) -> "ColumnTransformer | str":
+    """Optional PCA when the feature count exceeds n_pca (strictly greater); else passthrough."""
     if n_pca and X.shape[1] > n_pca:
         return ColumnTransformer([("pca", PCA(n_components=n_pca, random_state=0), list(X.columns))])
     return "passthrough"
@@ -87,7 +103,7 @@ def make_models(device: str | None, n_estimators: int, random_state: int) -> dic
             n_estimators=n_estimators, device=device, random_state=random_state
         )
     except ImportError:
-        print("[info] tabicl non installé -> baseline-seul (le gate de calibration reste valide)\n")
+        print("[info] tabicl not installed -> baseline-only (the calibration gate is still valid)\n")
     return models
 
 
@@ -166,6 +182,7 @@ def main() -> int:
     args = p.parse_args()
 
     X, y = load_dataset(args)
+    validate_inputs(X, y)
     print(f"dataset: n={len(y)}, features={X.shape[1]}, classes={y.nunique()}"
           f"{f' | PCA-{args.n_pca}' if args.n_pca and X.shape[1] > args.n_pca else ''} | folds={args.folds}\n")
 
@@ -179,7 +196,7 @@ def main() -> int:
 
     # --- gate ---
     if "TabICL" not in report.index:
-        print("\n[gate] TabICL absent -> baseline-only, no verdict. exit 0")
+        print("\n[gate] TabICL not installed -> baseline-only, no verdict. exit 0")
         return 0
     gm = args.gate_metric
     tab, base = report.loc["TabICL", gm], report.loc["baseline_HGB", gm]
