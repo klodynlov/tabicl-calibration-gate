@@ -5,6 +5,7 @@ import blocked in the subprocess), and the gate logic is tested directly with
 synthetic per-fold results.
 """
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -172,3 +173,80 @@ def test_e2e_require_candidate_exit2(tmp_path):
     r = run_script("--csv", write_csv(tmp_path, df), "--target", "label", "--require-candidate")
     assert r.returncode == 2
     assert "require-candidate" in r.stderr
+
+
+# --- plugin candidate (--candidate) -------------------------------------------
+
+def binary_csv(tmp_path: Path, n: int = 120) -> str:
+    rng = np.random.default_rng(0)
+    df = pd.DataFrame(rng.normal(size=(n, 4)), columns=list("abcd"))
+    df["label"] = (df["a"] + rng.normal(scale=0.5, size=n) > 0).astype(int)
+    return write_csv(tmp_path, df)
+
+
+def test_e2e_candidate_plugin_verdict(tmp_path):
+    # epsilon=1.0 -> the delta condition always passes: this asserts the plumbing
+    # (import, fit, paired gate, naming), not which model wins
+    r = run_script("--csv", binary_csv(tmp_path), "--target", "label",
+                   "--candidate", "sklearn.ensemble.RandomForestClassifier",
+                   "--candidate-args", '{"n_estimators": 30}', "--epsilon", "1.0")
+    assert r.returncode == 0, r.stderr
+    assert "RandomForestClassifier" in r.stdout and "PASS" in r.stdout
+
+
+def test_e2e_candidate_bad_import_exit2(tmp_path):
+    r = run_script("--csv", binary_csv(tmp_path), "--target", "label",
+                   "--candidate", "not.a.module:Nope")
+    assert r.returncode == 2
+    assert "cannot be imported" in r.stderr
+
+
+def test_e2e_candidate_without_predict_proba_exit2(tmp_path):
+    r = run_script("--csv", binary_csv(tmp_path), "--target", "label",
+                   "--candidate", "sklearn.svm.LinearSVC")
+    assert r.returncode == 2
+    assert "predict_proba" in r.stderr
+
+
+def test_e2e_candidate_args_bad_json_exit2(tmp_path):
+    r = run_script("--csv", binary_csv(tmp_path), "--target", "label",
+                   "--candidate", "sklearn.ensemble.RandomForestClassifier",
+                   "--candidate-args", "{nope")
+    assert r.returncode == 2
+    assert "JSON" in r.stderr
+
+
+def test_e2e_candidate_args_without_candidate_exit2(tmp_path):
+    r = run_script("--csv", binary_csv(tmp_path), "--target", "label",
+                   "--candidate-args", '{"n_estimators": 30}')
+    assert r.returncode == 2
+    assert "requires --candidate" in r.stderr
+
+
+# --- JSON report (--json) -----------------------------------------------------
+
+def test_e2e_json_report_baseline_only(tmp_path):
+    out = tmp_path / "report.json"
+    r = run_script("--csv", binary_csv(tmp_path), "--target", "label", "--json", str(out))
+    assert r.returncode == 0, r.stderr
+    doc = json.loads(out.read_text())
+    assert doc["schema_version"] == 1
+    assert doc["gate"] is None and doc["exit_code"] == 0
+    m = doc["models"]["baseline_HGB"]
+    assert set(m["metrics"]) == set(cg.METRICS)
+    assert all(len(v) == 5 for v in m["per_fold"].values())  # default --folds 5
+    assert isinstance(m["pooled_ece"], float)
+
+
+def test_e2e_json_report_with_candidate(tmp_path):
+    out = tmp_path / "report.json"
+    r = run_script("--csv", binary_csv(tmp_path), "--target", "label",
+                   "--candidate", "sklearn.ensemble.RandomForestClassifier",
+                   "--candidate-args", '{"n_estimators": 30}',
+                   "--epsilon", "1.0", "--json", str(out))
+    assert r.returncode == 0, r.stderr
+    doc = json.loads(out.read_text())
+    g = doc["gate"]
+    assert g["candidate"] == "RandomForestClassifier" and g["baseline"] == "baseline_HGB"
+    assert g["pass"] is True and doc["exit_code"] == 0
+    assert isinstance(g["delta_mean"], float) and isinstance(g["pooled_ece"], float)
