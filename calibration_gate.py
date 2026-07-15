@@ -25,11 +25,15 @@ Examples
     python calibration_gate.py --dataset wine --device mps --calibration
     python calibration_gate.py --csv data.csv --target label --n-pca 64
     python calibration_gate.py --csv data.csv --target y --gate-metric ece --max-ece 0.05
+    tabgate --csv data.csv --target y --candidate sklearn.ensemble.RandomForestClassifier \
+        --gate-metric ece --json report.json      # after `pip install .`
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib
+import json
 import sys
 import time
 
@@ -41,6 +45,8 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, log_loss
 from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn.pipeline import Pipeline
+
+__version__ = "0.2.0"
 
 METRICS = ["accuracy", "bal_acc", "f1_macro", "f1_weighted", "log_loss", "ece"]
 LOWER_IS_BETTER = {"log_loss", "ece"}
@@ -115,13 +121,50 @@ def make_features(X: pd.DataFrame, n_pca: int) -> "ColumnTransformer | str":
     return "passthrough"
 
 
-def make_models(device: str | None, n_estimators: int, random_state: int) -> dict:
-    models = {BASELINE: HistGradientBoostingClassifier(random_state=random_state)}
+def load_candidate(spec: str, args_json: str | None, random_state: int):
+    """Import and instantiate a plugin candidate ('module.path:ClassName' or dotted).
+
+    The class must be sklearn-compatible and expose predict_proba. random_state is
+    injected when the estimator accepts one and --candidate-args did not set it.
+    """
+    mod_name, _, cls_name = spec.replace(":", ".").rpartition(".")
+    if not mod_name:
+        fail(f"--candidate '{spec}' is not an import path (expected module.path:ClassName)")
+    try:
+        cls = getattr(importlib.import_module(mod_name), cls_name)
+    except (ImportError, AttributeError) as e:
+        fail(f"--candidate '{spec}' cannot be imported: {e}")
+    kwargs = {}
+    if args_json:
+        try:
+            kwargs = json.loads(args_json)
+        except ValueError as e:
+            fail(f"--candidate-args is not valid JSON: {e}")
+        if not isinstance(kwargs, dict):
+            fail(f"--candidate-args must be a JSON object, got {type(kwargs).__name__}")
+    try:
+        est = cls(**kwargs)
+    except TypeError as e:
+        fail(f"--candidate {cls_name}(**{kwargs}) failed to instantiate: {e}")
+    if not hasattr(est, "predict_proba"):
+        fail(f"--candidate {cls_name} has no predict_proba; the gate needs probabilities.")
+    if "random_state" not in kwargs and hasattr(est, "get_params") \
+            and "random_state" in est.get_params():
+        est.set_params(random_state=random_state)
+    return cls_name, est
+
+
+def make_models(args) -> dict:
+    models = {BASELINE: HistGradientBoostingClassifier(random_state=args.random_state)}
+    if args.candidate:
+        name, est = load_candidate(args.candidate, args.candidate_args, args.random_state)
+        models[name] = est
+        return models
     try:
         from tabicl import TabICLClassifier
 
         models[CANDIDATE] = TabICLClassifier(
-            n_estimators=n_estimators, device=device, random_state=random_state
+            n_estimators=args.n_estimators, device=args.device, random_state=args.random_state
         )
     except ImportError:
         print("[info] tabicl not installed -> baseline-only (the calibration gate is still valid)\n")
@@ -203,27 +246,75 @@ def print_calibration(name: str, conf: np.ndarray, correct: np.ndarray) -> None:
         print(f"  [{lo:.1f}-{hi:.1f}) n={n:5d}  conf={c:.3f}  acc={a:.3f}  gap={a - c:+.3f}")
 
 
-def run_gate(results: dict, metric: str, epsilon: float, max_ece: float | None) -> int:
-    """PASS/FAIL on the paired per-fold delta, plus an optional absolute ECE ceiling."""
-    cand = results[CANDIDATE]["per_fold"][metric].to_numpy()
+def compute_gate(results: dict, metric: str, epsilon: float, max_ece: float | None,
+                 candidate: str = CANDIDATE) -> dict:
+    """Verdict on the paired per-fold delta, plus an optional absolute ECE ceiling.
+
+    Pure computation (all values JSON-serializable); printing lives in print_gate.
+    """
+    cand = results[candidate]["per_fold"][metric].to_numpy()
     base = results[BASELINE]["per_fold"][metric].to_numpy()
     sign = -1.0 if metric in LOWER_IS_BETTER else 1.0
     deltas = sign * (cand - base)  # '+' = candidate better, whatever the metric direction
     mean_d = float(deltas.mean())
     std_d = float(deltas.std(ddof=1)) if len(deltas) > 1 else 0.0
-    ok = mean_d >= -epsilon
-    print(f"\n[gate] {metric}: {CANDIDATE}={cand.mean():.4f} vs {BASELINE}={base.mean():.4f} "
-          f"(epsilon={epsilon})")
-    print(f"[gate] paired delta per fold ('+' = candidate better): {mean_d:+.4f} ± {std_d:.4f} "
-          f"(min {deltas.min():+.4f}, {len(deltas)} folds) -> {'PASS' if ok else 'FAIL'}")
-    if max_ece is not None:
-        pooled, _ = ece_top_label(results[CANDIDATE]["conf"], results[CANDIDATE]["correct"])
-        ece_ok = pooled <= max_ece
-        print(f"[gate] ECE ceiling: candidate pooled ECE={pooled:.4f} "
-              f"{'<=' if ece_ok else '>'} {max_ece} -> {'PASS' if ece_ok else 'FAIL'}")
-        ok = ok and ece_ok
-        print(f"[gate] overall -> {'PASS' if ok else 'FAIL'}")
-    return 0 if ok else 1
+    delta_ok = mean_d >= -epsilon
+    pooled = float(ece_top_label(results[candidate]["conf"], results[candidate]["correct"])[0])
+    ece_ok = None if max_ece is None else bool(pooled <= max_ece)
+    return {
+        "metric": metric, "epsilon": epsilon, "candidate": candidate, "baseline": BASELINE,
+        "candidate_mean": float(cand.mean()), "baseline_mean": float(base.mean()),
+        "delta_mean": mean_d, "delta_std": std_d, "delta_min": float(deltas.min()),
+        "n_folds": int(len(deltas)), "delta_pass": bool(delta_ok),
+        "pooled_ece": pooled, "max_ece": max_ece, "ece_pass": ece_ok,
+        "pass": bool(delta_ok and ece_ok is not False),
+    }
+
+
+def print_gate(g: dict) -> None:
+    print(f"\n[gate] {g['metric']}: {g['candidate']}={g['candidate_mean']:.4f} "
+          f"vs {g['baseline']}={g['baseline_mean']:.4f} (epsilon={g['epsilon']})")
+    print(f"[gate] paired delta per fold ('+' = candidate better): "
+          f"{g['delta_mean']:+.4f} ± {g['delta_std']:.4f} "
+          f"(min {g['delta_min']:+.4f}, {g['n_folds']} folds) "
+          f"-> {'PASS' if g['delta_pass'] else 'FAIL'}")
+    if g["max_ece"] is not None:
+        print(f"[gate] ECE ceiling: candidate pooled ECE={g['pooled_ece']:.4f} "
+              f"{'<=' if g['ece_pass'] else '>'} {g['max_ece']} "
+              f"-> {'PASS' if g['ece_pass'] else 'FAIL'}")
+        print(f"[gate] overall -> {'PASS' if g['pass'] else 'FAIL'}")
+
+
+def run_gate(results: dict, metric: str, epsilon: float, max_ece: float | None,
+             candidate: str = CANDIDATE) -> int:
+    g = compute_gate(results, metric, epsilon, max_ece, candidate)
+    print_gate(g)
+    return 0 if g["pass"] else 1
+
+
+def write_json(path: str, args, X, y, results: dict, gate: dict | None, code: int,
+               pca_active: bool) -> None:
+    """Machine-readable report (written for PASS and FAIL alike — a CI artifact)."""
+    doc = {
+        "schema_version": 1,
+        "source": args.csv or args.dataset,
+        "dataset": {"n": int(len(y)), "n_features": int(X.shape[1]),
+                    "n_classes": int(y.nunique()), "folds": args.folds,
+                    "pca": args.n_pca if pca_active else None},
+        "models": {
+            name: {
+                "metrics": {k: float(v) for k, v in r["per_fold"].mean().items()},
+                "per_fold": {k: [float(x) for x in v]
+                             for k, v in r["per_fold"].to_dict("list").items()},
+                "pooled_ece": float(ece_top_label(r["conf"], r["correct"])[0]),
+                "wall_s": float(r["wall_s"]),
+            } for name, r in results.items()},
+        "gate": gate,
+        "exit_code": code,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2)
+    print(f"\n[json] report written to {path}")
 
 
 def main() -> int:
@@ -234,6 +325,15 @@ def main() -> int:
     src.add_argument("--target", default="target", help="target column name when using --csv")
     p.add_argument("--n-pca", type=int, default=64, help="PCA components if n_features exceeds it (0=off)")
     p.add_argument("--folds", type=int, default=5)
+    p.add_argument("--candidate", default=None, metavar="MODULE:CLASS",
+                   help="plugin candidate: import path of any sklearn-compatible classifier "
+                        "with predict_proba (e.g. sklearn.ensemble.RandomForestClassifier); "
+                        "replaces TabICL")
+    p.add_argument("--candidate-args", default=None, metavar="JSON",
+                   help="constructor kwargs for --candidate as a JSON object, "
+                        "e.g. '{\"n_estimators\": 200}'")
+    p.add_argument("--json", default=None, metavar="PATH", dest="json_path",
+                   help="write a machine-readable JSON report (written for PASS and FAIL alike)")
     p.add_argument("--n-estimators", type=int, default=8, help="TabICL ensemble size")
     p.add_argument("--device", default=None, help="TabICL device: 'mps', 'cpu', None=auto")
     p.add_argument("--gate-metric", default="f1_macro", choices=METRICS,
@@ -248,7 +348,10 @@ def main() -> int:
                    help="print reliability curves (ECE itself is always computed)")
     p.add_argument("--random-state", type=int, default=42,
                    help="seed for the models (CV splits stay fixed so both models share folds)")
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = p.parse_args()
+    if args.candidate_args and not args.candidate:
+        fail("--candidate-args requires --candidate")
 
     X, y = load_dataset(args)
     pca_active = bool(args.n_pca and X.shape[1] > args.n_pca)
@@ -256,8 +359,9 @@ def main() -> int:
     print(f"dataset: n={len(y)}, features={X.shape[1]}, classes={y.nunique()}"
           f"{f' | PCA-{args.n_pca}' if pca_active else ''} | folds={args.folds}\n")
 
-    models = make_models(args.device, args.n_estimators, args.random_state)
-    if CANDIDATE not in models and args.require_candidate:
+    models = make_models(args)
+    candidate_name = next((k for k in models if k != BASELINE), None)
+    if candidate_name is None and args.require_candidate:
         print("[error] --require-candidate set but tabicl is not installed", file=sys.stderr)
         return 2
 
@@ -273,10 +377,16 @@ def main() -> int:
         for name in models:
             print_calibration(name, results[name]["conf"], results[name]["correct"])
 
-    if CANDIDATE not in results:
+    gate, code = None, 0
+    if candidate_name is None:
         print(f"\n[gate] {CANDIDATE} not installed -> baseline-only, no verdict. exit 0")
-        return 0
-    return run_gate(results, args.gate_metric, args.epsilon, args.max_ece)
+    else:
+        gate = compute_gate(results, args.gate_metric, args.epsilon, args.max_ece, candidate_name)
+        print_gate(gate)
+        code = 0 if gate["pass"] else 1
+    if args.json_path:
+        write_json(args.json_path, args, X, y, results, gate, code, pca_active)
+    return code
 
 
 if __name__ == "__main__":

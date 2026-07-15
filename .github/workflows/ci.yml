@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install (package + test deps)
+        run: python -m pip install ".[test]"
+
+      - name: Unit + e2e tests (no tabicl needed)
+        run: python -m pytest -q
+
+      # --- dogfood: the gate gating itself ---------------------------------
+      - name: Dogfood — baseline-only, no verdict, exit 0
+        run: tabgate --dataset breast_cancer --calibration
+
+      - name: Dogfood — real verdict via plugin candidate (exit 0 or 1, never 2)
+        run: |
+          set +e
+          tabgate --dataset breast_cancer \
+            --candidate sklearn.ensemble.RandomForestClassifier \
+            --candidate-args '{"n_estimators": 200}' \
+            --gate-metric ece --max-ece 0.1 --json report.json
+          rc=$?
+          set -e
+          echo "gate exit code: $rc"
+          test "$rc" -le 1
+          python -c "
+          import json
+          r = json.load(open('report.json'))
+          assert r['gate']['candidate'] == 'RandomForestClassifier'
+          assert r['exit_code'] in (0, 1)
+          print(json.dumps(r['gate'], indent=2))
+          "
+
+      - name: Dogfood — invalid input must exit 2
+        run: |
+          set +e
+          printf 'a,label\n1,0\n2,1\nx,0\n' > bad.csv
+          tabgate --csv bad.csv --target label
+          rc=$?
+          set -e
+          echo "exit code: $rc"
+          test "$rc" -eq 2
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: report-py${{ matrix.python-version }}
+          path: report.json

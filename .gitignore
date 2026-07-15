@@ -5,3 +5,5 @@ venv/
 .DS_Store
 *.egg-info/
 .ipynb_checkpoints/
+build/
+dist/
