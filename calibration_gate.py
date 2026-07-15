@@ -7,11 +7,14 @@ and any confidence threshold you set downstream is noise.
 
 The gate computes out-of-fold predictions ONCE per model (stratified CV) and
 derives every metric from that single pass:
-  - accuracy, balanced accuracy, f1-macro, f1-weighted, log-loss, ECE
-  - a reliability curve + saturation flag (--calibration, no extra compute)
+  - accuracy, balanced accuracy, f1-macro, f1-weighted, log-loss, Brier, ECE
+  - a reliability curve + saturation flag + classwise-ECE (--calibration,
+    no extra compute); equal-width or equal-mass bins (--ece-binning)
   - a paired per-fold delta candidate-vs-baseline on the gated metric
     (both models are evaluated on identical folds, so the fold-wise difference
     is a paired sample — far less noisy than comparing two independent means)
+  - optional nested temperature-scaling diagnostic (--temperature): is the
+    miscalibration fixable by simple post-hoc scaling? Never affects the gate.
 
 Exit codes: 0 = PASS (or baseline-only, no verdict), 1 = gate FAIL, 2 = invalid input.
 
@@ -27,6 +30,8 @@ Examples
     python calibration_gate.py --csv data.csv --target y --gate-metric ece --max-ece 0.05
     tabgate --csv data.csv --target y --candidate sklearn.ensemble.RandomForestClassifier \
         --gate-metric ece --json report.json      # after `pip install .`
+    tabgate --csv data.csv --target y --max-classwise-ece 0.08 --ece-binning mass
+    tabgate --dataset breast_cancer --temperature --plot reliability.png
 """
 
 from __future__ import annotations
@@ -46,10 +51,10 @@ from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, l
 from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn.pipeline import Pipeline
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
-METRICS = ["accuracy", "bal_acc", "f1_macro", "f1_weighted", "log_loss", "ece"]
-LOWER_IS_BETTER = {"log_loss", "ece"}
+METRICS = ["accuracy", "bal_acc", "f1_macro", "f1_weighted", "log_loss", "brier", "ece"]
+LOWER_IS_BETTER = {"log_loss", "brier", "ece"}
 
 SKLEARN_DATASETS = {
     "breast_cancer": "load_breast_cancer",
@@ -171,16 +176,34 @@ def make_models(args) -> dict:
     return models
 
 
-def ece_top_label(conf: np.ndarray, correct: np.ndarray, n_bins: int = 10):
-    """Top-label ECE with equal-width bins.
+def bin_edges(conf: np.ndarray, n_bins: int, strategy: str) -> np.ndarray:
+    """Bin edges over [0, 1]: 'width' = equal-width, 'mass' = equal-mass (quantiles).
 
-    ECE = mean over bins of |accuracy - confidence|, weighted by bin population.
+    Equal-mass bins keep per-bin population balanced when confidences cluster
+    (e.g. most predictions above 0.99): equal-width bins then leave most bins
+    empty and one bin dominant, so the ECE rests on a single noisy cell.
+    Duplicate quantiles (heavy ties) are collapsed — fewer effective bins.
+    """
+    if strategy == "mass":
+        qs = np.quantile(conf, np.linspace(0.0, 1.0, n_bins + 1))
+        return np.unique(np.concatenate(([0.0], qs[1:-1], [1.0])))
+    return np.linspace(0.0, 1.0, n_bins + 1)
+
+
+def ece_top_label(conf: np.ndarray, correct: np.ndarray, n_bins: int = 10,
+                  strategy: str = "width"):
+    """Binned calibration error of a score against a binary outcome.
+
+    Used for top-label ECE (conf = max proba, outcome = prediction correct) and,
+    per class, for classwise-ECE (conf = p_class, outcome = sample is that class).
+    ECE = mean over bins of |outcome rate - confidence|, weighted by bin population.
     Returns (ece, rows) where rows = [(lo, hi, n, mean_conf, mean_acc), ...].
     """
-    edges = np.linspace(0.0, 1.0, n_bins + 1)
-    bins = np.clip(np.digitize(conf, edges[1:-1]), 0, n_bins - 1)
+    edges = bin_edges(conf, n_bins, strategy)
+    nb = len(edges) - 1
+    bins = np.clip(np.digitize(conf, edges[1:-1]), 0, nb - 1)
     ece, rows = 0.0, []
-    for b in range(n_bins):
+    for b in range(nb):
         m = bins == b
         if not m.any():
             continue
@@ -190,11 +213,40 @@ def ece_top_label(conf: np.ndarray, correct: np.ndarray, n_bins: int = 10):
     return ece, rows
 
 
-def evaluate_oof(X, y, models, n_pca, folds) -> dict:
+def brier_multiclass(proba: np.ndarray, y_idx: np.ndarray) -> float:
+    """Multiclass Brier score: mean squared error of the FULL probability vector
+    against the one-hot truth, range [0, 2]. Strictly proper — unlike accuracy,
+    it punishes confident mistakes more than hesitant ones.
+
+    Binary note: this is 2x sklearn's brier_score_loss (which scores the
+    positive-class probability only).
+    """
+    onehot = np.eye(proba.shape[1])[y_idx]
+    return float(np.mean(np.sum((proba - onehot) ** 2, axis=1)))
+
+
+def classwise_ece(proba: np.ndarray, y_idx: np.ndarray, n_bins: int = 10,
+                  strategy: str = "width"):
+    """Classwise-ECE: for each class c, calibration of p_c against the empirical
+    frequency of c, over ALL samples (Kull et al. 2019) — not just those predicted c.
+
+    Top-label ECE can look fine while one class is badly miscalibrated. Any
+    PER-CLASS confidence threshold downstream (auto-label class c above 0.6...)
+    depends on this, not on the top-label curve.
+    Returns (mean_over_classes, {class_index: ece}).
+    """
+    per_class = {c: ece_top_label(proba[:, c], y_idx == c, n_bins, strategy)[0]
+                 for c in range(proba.shape[1])}
+    return float(np.mean(list(per_class.values()))), per_class
+
+
+def evaluate_oof(X, y, models, n_pca, folds, ece_bins: int = 10,
+                 ece_binning: str = "width") -> dict:
     """One out-of-fold predict_proba pass per model; every metric derives from it.
 
-    Returns {name: {"per_fold": DataFrame(folds x METRICS), "conf": ..., "correct": ...,
-    "wall_s": float}}. All models share the exact same folds (paired comparison).
+    Returns {name: {"per_fold": DataFrame(folds x METRICS), "proba": ..., "conf": ...,
+    "correct": ..., "y_idx": ..., "classes": ..., "wall_s": float}}.
+    All models share the exact same folds (paired comparison).
     """
     cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=0)
     classes = np.unique(y)
@@ -217,10 +269,12 @@ def evaluate_oof(X, y, models, n_pca, folds) -> dict:
                 "f1_macro": f1_score(yt, pt, average="macro", zero_division=0),
                 "f1_weighted": f1_score(yt, pt, average="weighted", zero_division=0),
                 "log_loss": log_loss(yt, proba[test], labels=labels),
-                "ece": ece_top_label(conf[test], pt == yt)[0],
+                "brier": brier_multiclass(proba[test], yt),
+                "ece": ece_top_label(conf[test], pt == yt, ece_bins, ece_binning)[0],
             })
-        results[name] = {"per_fold": pd.DataFrame(rows), "conf": conf,
-                         "correct": pred == y_idx, "wall_s": wall}
+        results[name] = {"per_fold": pd.DataFrame(rows), "proba": proba, "conf": conf,
+                         "correct": pred == y_idx, "y_idx": y_idx, "classes": classes,
+                         "wall_s": wall}
     return results
 
 
@@ -230,10 +284,11 @@ def summary_table(results: dict) -> pd.DataFrame:
     return pd.DataFrame(rows).set_index("model")[METRICS + ["wall_s"]]
 
 
-def print_calibration(name: str, conf: np.ndarray, correct: np.ndarray) -> None:
-    """Reliability curve on the pooled OOF predictions (the table's ece column is
-    the per-fold mean; the two differ slightly by construction)."""
-    ece, rows = ece_top_label(conf, correct)
+def print_calibration(name: str, r: dict, n_bins: int = 10, strategy: str = "width") -> None:
+    """Reliability curve + classwise-ECE on the pooled OOF predictions (the table's
+    ece column is the per-fold mean; the two differ slightly by construction)."""
+    conf, correct = r["conf"], r["correct"]
+    ece, rows = ece_top_label(conf, correct, n_bins, strategy)
     sat = float((conf > 0.99).mean())
     # Saturation is only a problem when it comes WITH miscalibration (high ECE).
     # On easy datasets, confidently-correct predictions saturate legitimately.
@@ -241,14 +296,20 @@ def print_calibration(name: str, conf: np.ndarray, correct: np.ndarray) -> None:
     print(f"\n=== calibration: {name} ===")
     print(f"mean confidence={conf.mean():.3f} | accuracy={correct.mean():.3f} | ECE={ece:.4f} (pooled)")
     print(f"share conf>0.99 = {sat:.1%}{warn}")
-    print("reliability curve (confidence vs accuracy per bin):")
+    cw_mean, per_class = classwise_ece(r["proba"], r["y_idx"], n_bins, strategy)
+    worst = sorted(per_class.items(), key=lambda kv: -kv[1])[:3]
+    print(f"classwise-ECE mean={cw_mean:.4f} | worst: "
+          + ", ".join(f"{r['classes'][c]}={e:.4f}" for c, e in worst))
+    print(f"reliability curve (confidence vs accuracy per bin, {strategy} bins):")
     for lo, hi, n, c, a in rows:
-        print(f"  [{lo:.1f}-{hi:.1f}) n={n:5d}  conf={c:.3f}  acc={a:.3f}  gap={a - c:+.3f}")
+        print(f"  [{lo:.2f}-{hi:.2f}) n={n:5d}  conf={c:.3f}  acc={a:.3f}  gap={a - c:+.3f}")
 
 
 def compute_gate(results: dict, metric: str, epsilon: float, max_ece: float | None,
-                 candidate: str = CANDIDATE) -> dict:
-    """Verdict on the paired per-fold delta, plus an optional absolute ECE ceiling.
+                 candidate: str = CANDIDATE, max_classwise_ece: float | None = None,
+                 ece_bins: int = 10, ece_binning: str = "width") -> dict:
+    """Verdict on the paired per-fold delta, plus optional absolute ceilings on the
+    candidate's pooled ECE and on its WORST per-class ECE.
 
     Pure computation (all values JSON-serializable); printing lives in print_gate.
     """
@@ -259,15 +320,26 @@ def compute_gate(results: dict, metric: str, epsilon: float, max_ece: float | No
     mean_d = float(deltas.mean())
     std_d = float(deltas.std(ddof=1)) if len(deltas) > 1 else 0.0
     delta_ok = mean_d >= -epsilon
-    pooled = float(ece_top_label(results[candidate]["conf"], results[candidate]["correct"])[0])
+    pooled = float(ece_top_label(results[candidate]["conf"], results[candidate]["correct"],
+                                 ece_bins, ece_binning)[0])
     ece_ok = None if max_ece is None else bool(pooled <= max_ece)
+    cw_worst, cw_ok = None, None
+    if max_classwise_ece is not None:
+        _, per_class = classwise_ece(results[candidate]["proba"], results[candidate]["y_idx"],
+                                     ece_bins, ece_binning)
+        wc = max(per_class, key=per_class.get)
+        cw_worst = {"class": str(results[candidate]["classes"][wc]),
+                    "ece": float(per_class[wc])}
+        cw_ok = bool(per_class[wc] <= max_classwise_ece)
     return {
         "metric": metric, "epsilon": epsilon, "candidate": candidate, "baseline": BASELINE,
         "candidate_mean": float(cand.mean()), "baseline_mean": float(base.mean()),
         "delta_mean": mean_d, "delta_std": std_d, "delta_min": float(deltas.min()),
         "n_folds": int(len(deltas)), "delta_pass": bool(delta_ok),
         "pooled_ece": pooled, "max_ece": max_ece, "ece_pass": ece_ok,
-        "pass": bool(delta_ok and ece_ok is not False),
+        "classwise_worst": cw_worst, "max_classwise_ece": max_classwise_ece,
+        "classwise_pass": cw_ok,
+        "pass": bool(delta_ok and ece_ok is not False and cw_ok is not False),
     }
 
 
@@ -282,6 +354,12 @@ def print_gate(g: dict) -> None:
         print(f"[gate] ECE ceiling: candidate pooled ECE={g['pooled_ece']:.4f} "
               f"{'<=' if g['ece_pass'] else '>'} {g['max_ece']} "
               f"-> {'PASS' if g['ece_pass'] else 'FAIL'}")
+    if g["max_classwise_ece"] is not None:
+        print(f"[gate] classwise-ECE ceiling: worst class '{g['classwise_worst']['class']}' "
+              f"ECE={g['classwise_worst']['ece']:.4f} "
+              f"{'<=' if g['classwise_pass'] else '>'} {g['max_classwise_ece']} "
+              f"-> {'PASS' if g['classwise_pass'] else 'FAIL'}")
+    if g["max_ece"] is not None or g["max_classwise_ece"] is not None:
         print(f"[gate] overall -> {'PASS' if g['pass'] else 'FAIL'}")
 
 
@@ -292,24 +370,152 @@ def run_gate(results: dict, metric: str, epsilon: float, max_ece: float | None,
     return 0 if g["pass"] else 1
 
 
+def fit_temperature(proba: np.ndarray, y_idx: np.ndarray) -> float:
+    """Scalar temperature minimizing the NLL of softmax(log(p)/T), using log-probs
+    as pseudo-logits (standard when true logits are unavailable; the rescaling is
+    monotone, so predictions never change — only confidence does).
+
+    T > 1 softens over-confident probabilities, T < 1 sharpens under-confident
+    ones. Scalar + smooth in log T -> a log-spaced grid beats an optimizer dep.
+    """
+    logp = np.log(np.clip(proba, 1e-12, 1.0))
+    idx = np.arange(len(y_idx))
+    best_t, best_nll = 1.0, np.inf
+    for t in np.logspace(np.log10(0.05), np.log10(20.0), 161):
+        z = logp / t
+        z -= z.max(axis=1, keepdims=True)
+        p = np.exp(z)
+        p /= p.sum(axis=1, keepdims=True)
+        nll = float(-np.mean(np.log(np.clip(p[idx, y_idx], 1e-12, None))))
+        if nll < best_nll:
+            best_t, best_nll = float(t), nll
+    return best_t
+
+
+def apply_temperature(proba: np.ndarray, t: float) -> np.ndarray:
+    z = np.log(np.clip(proba, 1e-12, 1.0)) / t
+    z -= z.max(axis=1, keepdims=True)
+    p = np.exp(z)
+    return p / p.sum(axis=1, keepdims=True)
+
+
+def temperature_pass(X, y, models, results, n_pca, folds, ece_bins: int = 10,
+                     ece_binning: str = "width", inner_folds: int = 3) -> dict:
+    """Nested temperature-scaling diagnostic: is the miscalibration fixable by
+    simple post-hoc scaling?
+
+    For each outer fold, T is fitted on inner-CV out-of-fold probabilities of the
+    TRAINING part only (cloned pipeline — the test fold never touches the T fit),
+    then applied to the outer test probabilities of the main pass. Leak-free, but
+    costs ~(folds-1)x extra predictions per model. Diagnostic only: the gate
+    never uses tempered values.
+    """
+    from sklearn.base import clone
+
+    cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=0)
+    y_arr = np.asarray(y)
+    out = {}
+    for name, model in models.items():
+        r = results[name]
+        tempered = np.empty_like(r["proba"])
+        ts = []
+        for train, test in cv.split(X, y):
+            min_count = int(np.bincount(r["y_idx"][train]).min())
+            k = min(inner_folds, min_count)
+            if k < 2:
+                fail(f"--temperature needs >= 2 members per class inside each training "
+                     f"split (smallest has {min_count}); lower --folds or drop rare classes.")
+            pipe = Pipeline([("feat", make_features(X, n_pca)), ("clf", clone(model))])
+            inner_cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=1)
+            p_inner = cross_val_predict(pipe, X.iloc[train], y_arr[train], cv=inner_cv,
+                                        method="predict_proba", n_jobs=1)
+            t = fit_temperature(p_inner, r["y_idx"][train])
+            ts.append(t)
+            tempered[test] = apply_temperature(r["proba"][test], t)
+        # argmax is unchanged by monotone scaling -> same predictions, same "correct"
+        ece_after = ece_top_label(tempered.max(axis=1), r["correct"], ece_bins, ece_binning)[0]
+        ece_before = ece_top_label(r["conf"], r["correct"], ece_bins, ece_binning)[0]
+        out[name] = {"t_per_fold": [float(t) for t in ts], "t_mean": float(np.mean(ts)),
+                     "ece_before": float(ece_before), "ece_after": float(ece_after)}
+    return out
+
+
+def print_temperature(temp: dict) -> None:
+    print("\n=== temperature scaling (nested, diagnostic — never gates) ===")
+    for name, t in temp.items():
+        note = ""
+        if t["ece_before"] > 0.02 and t["ece_after"] < 0.5 * t["ece_before"]:
+            note = "   <-- post-hoc scaling would fix most of the miscalibration"
+        elif abs(t["t_mean"] - 1.0) < 0.1:
+            note = "   (T ~= 1: probabilities already well scaled)"
+        print(f"{name}: T={t['t_mean']:.3f} "
+              f"(per fold: {', '.join(f'{x:.2f}' for x in t['t_per_fold'])}) | "
+              f"pooled ECE {t['ece_before']:.4f} -> {t['ece_after']:.4f}{note}")
+
+
+def write_plot(path: str, results: dict, ece_bins: int = 10, ece_binning: str = "width") -> None:
+    """Reliability-diagram PNG on the pooled OOF predictions (all models)."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")  # headless-safe, no display needed
+        import matplotlib.pyplot as plt
+    except ImportError:
+        fail("--plot requires matplotlib: pip install matplotlib (or: pip install '.[plot]')")
+    fig, ax = plt.subplots(figsize=(6.4, 6.4))
+    ax.plot([0, 1], [0, 1], "k--", lw=1, label="perfect calibration")
+    for name, r in results.items():
+        ece, rows = ece_top_label(r["conf"], r["correct"], ece_bins, ece_binning)
+        xs = [row[3] for row in rows]
+        ys = [row[4] for row in rows]
+        sizes = [20 + 180 * row[2] / len(r["conf"]) for row in rows]  # area ~ bin population
+        line, = ax.plot(xs, ys, "-", alpha=0.8, label=f"{name} (ECE={ece:.4f})")
+        ax.scatter(xs, ys, s=sizes, color=line.get_color(), alpha=0.7, zorder=3)
+    ax.set_xlabel("mean predicted confidence (per bin)")
+    ax.set_ylabel("empirical accuracy (per bin)")
+    ax.set_title(f"Reliability diagram — pooled OOF, {ece_binning} bins\n"
+                 f"(marker area ~ bin population)", fontsize=11)
+    ax.set_xlim(0, 1.02)
+    ax.set_ylim(0, 1.02)
+    ax.grid(alpha=0.3)
+    ax.legend(loc="lower right")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"\n[plot] reliability diagram written to {path}")
+
+
 def write_json(path: str, args, X, y, results: dict, gate: dict | None, code: int,
-               pca_active: bool) -> None:
-    """Machine-readable report (written for PASS and FAIL alike — a CI artifact)."""
+               pca_active: bool, temperature: dict | None = None) -> None:
+    """Machine-readable report (written for PASS and FAIL alike — a CI artifact).
+
+    schema_version 2: adds brier to metrics, classwise_ece per model, the binning
+    params, and the optional temperature block (all additive vs v1).
+    """
+    def model_block(r: dict) -> dict:
+        cw_mean, per_class = classwise_ece(r["proba"], r["y_idx"],
+                                           args.ece_bins, args.ece_binning)
+        return {
+            "metrics": {k: float(v) for k, v in r["per_fold"].mean().items()},
+            "per_fold": {k: [float(x) for x in v]
+                         for k, v in r["per_fold"].to_dict("list").items()},
+            "pooled_ece": float(ece_top_label(r["conf"], r["correct"],
+                                              args.ece_bins, args.ece_binning)[0]),
+            "classwise_ece": {"mean": cw_mean,
+                              "per_class": {str(r["classes"][c]): float(e)
+                                            for c, e in per_class.items()}},
+            "wall_s": float(r["wall_s"]),
+        }
+
     doc = {
-        "schema_version": 1,
+        "schema_version": 2,
         "source": args.csv or args.dataset,
         "dataset": {"n": int(len(y)), "n_features": int(X.shape[1]),
                     "n_classes": int(y.nunique()), "folds": args.folds,
                     "pca": args.n_pca if pca_active else None},
-        "models": {
-            name: {
-                "metrics": {k: float(v) for k, v in r["per_fold"].mean().items()},
-                "per_fold": {k: [float(x) for x in v]
-                             for k, v in r["per_fold"].to_dict("list").items()},
-                "pooled_ece": float(ece_top_label(r["conf"], r["correct"])[0]),
-                "wall_s": float(r["wall_s"]),
-            } for name, r in results.items()},
+        "params": {"ece_bins": args.ece_bins, "ece_binning": args.ece_binning},
+        "models": {name: model_block(r) for name, r in results.items()},
         "gate": gate,
+        "temperature": temperature,
         "exit_code": code,
     }
     with open(path, "w", encoding="utf-8") as f:
@@ -337,21 +543,38 @@ def main() -> int:
     p.add_argument("--n-estimators", type=int, default=8, help="TabICL ensemble size")
     p.add_argument("--device", default=None, help="TabICL device: 'mps', 'cpu', None=auto")
     p.add_argument("--gate-metric", default="f1_macro", choices=METRICS,
-                   help="metric the PASS/FAIL is decided on (log_loss and ece gate lower-is-better)")
+                   help="metric the PASS/FAIL is decided on "
+                        "(log_loss, brier and ece gate lower-is-better)")
     p.add_argument("--epsilon", type=float, default=0.0,
                    help="tolerance on the paired mean delta: candidate may be worse by up to epsilon")
     p.add_argument("--max-ece", type=float, default=None,
                    help="absolute ceiling on the candidate's pooled ECE (second gate condition)")
+    p.add_argument("--max-classwise-ece", type=float, default=None,
+                   help="ceiling on the candidate's WORST per-class ECE — the guard to set "
+                        "when downstream uses per-class confidence thresholds")
+    p.add_argument("--ece-bins", type=int, default=10, help="number of calibration bins")
+    p.add_argument("--ece-binning", choices=["width", "mass"], default="width",
+                   help="bin strategy for every ECE (table, gate, curves): equal-width or "
+                        "equal-mass (quantile) — mass stays informative when confidences "
+                        "cluster near 1.0")
+    p.add_argument("--temperature", action="store_true",
+                   help="nested temperature-scaling diagnostic (T fitted on inner-CV train "
+                        "probabilities, leak-free): shows whether post-hoc scaling would fix "
+                        "the miscalibration; never affects the gate; ~(folds-1)x extra predictions")
+    p.add_argument("--plot", default=None, metavar="PATH",
+                   help="write a reliability-diagram PNG (requires matplotlib)")
     p.add_argument("--require-candidate", action="store_true",
                    help="exit 2 when tabicl is not installed (instead of green baseline-only)")
     p.add_argument("--calibration", action="store_true",
-                   help="print reliability curves (ECE itself is always computed)")
+                   help="print reliability curves + classwise-ECE (ECE itself is always computed)")
     p.add_argument("--random-state", type=int, default=42,
                    help="seed for the models (CV splits stay fixed so both models share folds)")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = p.parse_args()
     if args.candidate_args and not args.candidate:
         fail("--candidate-args requires --candidate")
+    if args.ece_bins < 2:
+        fail("--ece-bins must be >= 2")
 
     X, y = load_dataset(args)
     pca_active = bool(args.n_pca and X.shape[1] > args.n_pca)
@@ -365,7 +588,8 @@ def main() -> int:
         print("[error] --require-candidate set but tabicl is not installed", file=sys.stderr)
         return 2
 
-    results = evaluate_oof(X, y, models, args.n_pca, args.folds)
+    results = evaluate_oof(X, y, models, args.n_pca, args.folds,
+                           args.ece_bins, args.ece_binning)
     report = summary_table(results)
     pd.set_option("display.float_format", lambda v: f"{v:.4f}")
     print(report.to_string())
@@ -375,17 +599,27 @@ def main() -> int:
 
     if args.calibration:
         for name in models:
-            print_calibration(name, results[name]["conf"], results[name]["correct"])
+            print_calibration(name, results[name], args.ece_bins, args.ece_binning)
+
+    temperature = None
+    if args.temperature:
+        temperature = temperature_pass(X, y, models, results, args.n_pca, args.folds,
+                                       args.ece_bins, args.ece_binning)
+        print_temperature(temperature)
 
     gate, code = None, 0
     if candidate_name is None:
         print(f"\n[gate] {CANDIDATE} not installed -> baseline-only, no verdict. exit 0")
     else:
-        gate = compute_gate(results, args.gate_metric, args.epsilon, args.max_ece, candidate_name)
+        gate = compute_gate(results, args.gate_metric, args.epsilon, args.max_ece,
+                            candidate_name, args.max_classwise_ece,
+                            args.ece_bins, args.ece_binning)
         print_gate(gate)
         code = 0 if gate["pass"] else 1
+    if args.plot:
+        write_plot(args.plot, results, args.ece_bins, args.ece_binning)
     if args.json_path:
-        write_json(args.json_path, args, X, y, results, gate, code, pca_active)
+        write_json(args.json_path, args, X, y, results, gate, code, pca_active, temperature)
     return code
 
 

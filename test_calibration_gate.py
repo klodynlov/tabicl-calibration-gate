@@ -5,6 +5,7 @@ import blocked in the subprocess), and the gate logic is tested directly with
 synthetic per-fold results.
 """
 
+import importlib.util
 import json
 import subprocess
 import sys
@@ -19,13 +20,14 @@ import calibration_gate as cg
 SCRIPT = Path(__file__).with_name("calibration_gate.py")
 
 
-def run_script(*argv: str) -> subprocess.CompletedProcess:
-    """Run the gate in a subprocess with the tabicl import blocked (baseline-only,
-    deterministic even in an env where tabicl is installed)."""
-    code = (f"import sys; sys.modules['tabicl'] = None; "
+def run_script(*argv: str, block: tuple = ("tabicl",)) -> subprocess.CompletedProcess:
+    """Run the gate in a subprocess with the given imports blocked (tabicl by
+    default -> baseline-only, deterministic even in an env where it is installed)."""
+    blocks = "; ".join(f"sys.modules['{m}'] = None" for m in block)
+    code = (f"import sys; {blocks}; "
             f"exec(compile(open(r'{SCRIPT}').read(), r'{SCRIPT}', 'exec'))")
     return subprocess.run([sys.executable, "-c", code, *argv],
-                          capture_output=True, text=True, timeout=120)
+                          capture_output=True, text=True, timeout=180)
 
 
 def write_csv(tmp_path: Path, df: pd.DataFrame) -> str:
@@ -230,12 +232,15 @@ def test_e2e_json_report_baseline_only(tmp_path):
     r = run_script("--csv", binary_csv(tmp_path), "--target", "label", "--json", str(out))
     assert r.returncode == 0, r.stderr
     doc = json.loads(out.read_text())
-    assert doc["schema_version"] == 1
+    assert doc["schema_version"] == 2
     assert doc["gate"] is None and doc["exit_code"] == 0
+    assert doc["temperature"] is None  # --temperature not passed
     m = doc["models"]["baseline_HGB"]
-    assert set(m["metrics"]) == set(cg.METRICS)
+    assert set(m["metrics"]) == set(cg.METRICS)  # includes brier
     assert all(len(v) == 5 for v in m["per_fold"].values())  # default --folds 5
     assert isinstance(m["pooled_ece"], float)
+    assert isinstance(m["classwise_ece"]["mean"], float)
+    assert len(m["classwise_ece"]["per_class"]) == 2  # binary_csv -> 2 classes
 
 
 def test_e2e_json_report_with_candidate(tmp_path):
@@ -250,3 +255,153 @@ def test_e2e_json_report_with_candidate(tmp_path):
     assert g["candidate"] == "RandomForestClassifier" and g["baseline"] == "baseline_HGB"
     assert g["pass"] is True and doc["exit_code"] == 0
     assert isinstance(g["delta_mean"], float) and isinstance(g["pooled_ece"], float)
+
+
+# --- P2: Brier ----------------------------------------------------------------
+
+def test_brier_perfect_wrong_uniform():
+    perfect = np.array([[1.0, 0.0], [0.0, 1.0]])
+    assert cg.brier_multiclass(perfect, np.array([0, 1])) == pytest.approx(0.0)
+    wrong = np.array([[0.0, 1.0]])
+    assert cg.brier_multiclass(wrong, np.array([0])) == pytest.approx(2.0)  # max penalty
+    uniform = np.array([[0.5, 0.5]])
+    assert cg.brier_multiclass(uniform, np.array([0])) == pytest.approx(0.5)
+
+
+def test_gate_metric_brier_lower_is_better():
+    r = make_results([0.30, 0.32, 0.31], [0.10, 0.12, 0.11], metric="brier")
+    assert cg.run_gate(r, "brier", 0.0, None) == 0
+    r = make_results([0.10, 0.12, 0.11], [0.30, 0.32, 0.31], metric="brier")
+    assert cg.run_gate(r, "brier", 0.0, None) == 1
+
+
+# --- P2: equal-mass bins --------------------------------------------------------
+
+def test_bin_edges_mass_balances_population():
+    rng = np.random.default_rng(0)
+    conf = rng.uniform(0.5, 1.0, 1000)
+    edges = cg.bin_edges(conf, 10, "mass")
+    counts = np.histogram(conf, edges)[0]
+    assert len(edges) == 11 and counts.min() >= 90  # ~100 per bin
+    # heavy ties near 1.0: duplicate quantiles collapse instead of crashing
+    clustered = np.concatenate([np.full(950, 0.99), rng.uniform(0.5, 0.9, 50)])
+    edges = cg.bin_edges(clustered, 10, "mass")
+    assert edges[0] == 0.0 and edges[-1] == 1.0 and len(edges) >= 2
+    ece, rows = cg.ece_top_label(clustered, np.ones(1000, dtype=bool), 10, "mass")
+    assert np.isfinite(ece) and rows
+
+
+def test_ece_equal_mass_known_value():
+    conf = np.array([0.6] * 50 + [0.9] * 50)
+    correct = np.array([True] * 25 + [False] * 25 + [True] * 40 + [False] * 10)
+    # 2 mass bins split at the median -> bin1: conf .6 acc .5, bin2: conf .9 acc .8
+    ece, _ = cg.ece_top_label(conf, correct, 2, "mass")
+    assert ece == pytest.approx(0.5 * 0.1 + 0.5 * 0.1, abs=1e-9)
+
+
+# --- P2: classwise-ECE ----------------------------------------------------------
+
+def test_classwise_ece_known_values():
+    proba = np.tile([0.7, 0.3], (100, 1))
+    y = np.array([0] * 70 + [1] * 30)  # frequencies match the probabilities
+    mean, per_class = cg.classwise_ece(proba, y)
+    assert mean == pytest.approx(0.0, abs=1e-9)
+    y = np.array([0] * 50 + [1] * 50)  # p(class0)=0.7 but freq=0.5 -> gap 0.2 each
+    mean, per_class = cg.classwise_ece(proba, y)
+    assert per_class[0] == pytest.approx(0.2, abs=1e-9)
+    assert per_class[1] == pytest.approx(0.2, abs=1e-9)
+
+
+def test_gate_max_classwise_ece_ceiling():
+    r = make_results([0.90] * 3, [0.95] * 3)
+    proba = np.tile([0.9, 0.1], (200, 1))
+    y_idx = np.array([0] * 120 + [1] * 80)  # p=0.9 vs freq 0.6 -> worst class ECE 0.3
+    r[cg.CANDIDATE].update(proba=proba, y_idx=y_idx, classes=np.array(["A", "B"]))
+    g = cg.compute_gate(r, "f1_macro", 0.0, None, max_classwise_ece=0.05)
+    assert g["classwise_pass"] is False and g["pass"] is False
+    assert g["classwise_worst"]["ece"] == pytest.approx(0.3, abs=1e-9)
+    g = cg.compute_gate(r, "f1_macro", 0.0, None, max_classwise_ece=0.5)
+    assert g["classwise_pass"] is True and g["pass"] is True
+
+
+def test_e2e_max_classwise_ece_exit_codes(tmp_path):
+    csv = binary_csv(tmp_path)
+    common = ("--csv", csv, "--target", "label",
+              "--candidate", "sklearn.ensemble.RandomForestClassifier",
+              "--candidate-args", '{"n_estimators": 30}', "--epsilon", "1.0")
+    r = run_script(*common, "--max-classwise-ece", "1.0")
+    assert r.returncode == 0, r.stderr
+    assert "classwise-ECE ceiling" in r.stdout and "overall -> PASS" in r.stdout
+    r = run_script(*common, "--max-classwise-ece", "0.0000001")
+    assert r.returncode == 1
+    assert "overall -> FAIL" in r.stdout
+
+
+# --- P2: temperature scaling ----------------------------------------------------
+
+def test_fit_temperature_recovers_overconfidence():
+    rng = np.random.default_rng(0)
+    z = rng.normal(size=(4000, 3))
+    p_true = np.exp(z) / np.exp(z).sum(axis=1, keepdims=True)
+    y = (rng.random(4000)[:, None] > np.cumsum(p_true, axis=1)).sum(axis=1)
+    over = cg.apply_temperature(p_true, 0.5)  # sharpened by 2 -> needs T ~= 2 to undo
+    t = cg.fit_temperature(over, y)
+    assert 1.6 < t < 2.5
+    calibrated = cg.fit_temperature(p_true, y)  # already calibrated -> T ~= 1
+    assert 0.8 < calibrated < 1.25
+
+
+def test_apply_temperature_preserves_argmax():
+    rng = np.random.default_rng(1)
+    p = rng.dirichlet(np.ones(4), size=200)
+    for t in (0.3, 3.0):
+        assert (cg.apply_temperature(p, t).argmax(1) == p.argmax(1)).all()
+
+
+def test_e2e_temperature_diagnostic(tmp_path):
+    out = tmp_path / "report.json"
+    r = run_script("--csv", binary_csv(tmp_path, n=160), "--target", "label",
+                   "--candidate", "sklearn.ensemble.RandomForestClassifier",
+                   "--candidate-args", '{"n_estimators": 30}', "--epsilon", "1.0",
+                   "--temperature", "--json", str(out))
+    assert r.returncode == 0, r.stderr
+    assert "temperature scaling" in r.stdout
+    doc = json.loads(out.read_text())
+    t = doc["temperature"]["RandomForestClassifier"]
+    assert len(t["t_per_fold"]) == 5 and t["t_mean"] > 0
+    assert isinstance(t["ece_before"], float) and isinstance(t["ece_after"], float)
+
+
+# --- P2: misc CLI ---------------------------------------------------------------
+
+def test_e2e_gate_metric_brier_and_mass_binning(tmp_path):
+    r = run_script("--csv", binary_csv(tmp_path), "--target", "label",
+                   "--candidate", "sklearn.ensemble.RandomForestClassifier",
+                   "--candidate-args", '{"n_estimators": 30}', "--epsilon", "1.0",
+                   "--gate-metric", "brier", "--ece-binning", "mass", "--calibration")
+    assert r.returncode == 0, r.stderr
+    assert "[gate] brier:" in r.stdout
+    assert "classwise-ECE mean=" in r.stdout
+    assert "mass bins" in r.stdout
+
+
+def test_e2e_ece_bins_too_small_exit2(tmp_path):
+    r = run_script("--csv", binary_csv(tmp_path), "--target", "label", "--ece-bins", "1")
+    assert r.returncode == 2
+    assert "--ece-bins" in r.stderr
+
+
+def test_e2e_plot_without_matplotlib_exit2(tmp_path):
+    r = run_script("--csv", binary_csv(tmp_path), "--target", "label",
+                   "--plot", str(tmp_path / "rel.png"), block=("tabicl", "matplotlib"))
+    assert r.returncode == 2
+    assert "matplotlib" in r.stderr
+
+
+@pytest.mark.skipif(importlib.util.find_spec("matplotlib") is None,
+                    reason="matplotlib not installed")
+def test_e2e_plot_written(tmp_path):
+    png = tmp_path / "rel.png"
+    r = run_script("--csv", binary_csv(tmp_path), "--target", "label", "--plot", str(png))
+    assert r.returncode == 0, r.stderr
+    assert png.exists() and png.stat().st_size > 1000

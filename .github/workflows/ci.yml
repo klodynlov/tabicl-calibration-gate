@@ -57,7 +57,34 @@ jobs:
           echo "exit code: $rc"
           test "$rc" -eq 2
 
+      - name: Dogfood — P2 flags (brier gate, mass bins, classwise ceiling, temperature)
+        run: |
+          set +e
+          tabgate --dataset breast_cancer \
+            --candidate sklearn.ensemble.RandomForestClassifier \
+            --candidate-args '{"n_estimators": 200}' \
+            --gate-metric brier --ece-binning mass --max-classwise-ece 0.5 \
+            --temperature --json report_p2.json
+          rc=$?
+          set -e
+          echo "gate exit code: $rc"
+          test "$rc" -le 1
+          python -c "
+          import json
+          r = json.load(open('report_p2.json'))
+          assert r['schema_version'] == 2
+          assert r['params'] == {'ece_bins': 10, 'ece_binning': 'mass'}
+          assert 'brier' in r['models']['baseline_HGB']['metrics']
+          assert len(r['models']['RandomForestClassifier']['classwise_ece']['per_class']) == 2
+          t = r['temperature']['RandomForestClassifier']
+          assert len(t['t_per_fold']) == 5 and t['t_mean'] > 0
+          assert r['gate']['classwise_worst'] is not None
+          print(json.dumps({'gate': r['gate'], 'temperature': r['temperature']}, indent=2))
+          "
+
       - uses: actions/upload-artifact@v4
         with:
           name: report-py${{ matrix.python-version }}
-          path: report.json
+          path: |
+            report.json
+            report_p2.json
