@@ -4,13 +4,13 @@ A small, reusable **calibration gate** for tabular classifiers — TabICL-first,
 
 Before you trust a model's probabilities, you should check one thing: **is its confidence calibrated?** A model can be accurate yet pathologically over-confident — its predicted probabilities then mean nothing, and any confidence threshold you set downstream (auto-label above 0.8, escalate below 0.5…) is noise.
 
-This gate runs stratified cross-validation and reports, per model:
+This gate computes out-of-fold predictions **once** per model (stratified CV) and derives everything from that single pass:
 
-- accuracy, balanced accuracy, **f1-macro**, f1-weighted, log-loss
-- **Expected Calibration Error (ECE)** + a text **reliability curve**
+- accuracy, balanced accuracy, **f1-macro**, f1-weighted, log-loss, **Expected Calibration Error (ECE)** — all in the main table
+- a text **reliability curve** (`--calibration`, no extra compute)
 - a saturation flag (only raised when over-confidence comes *with* miscalibration)
 
-and **gates** a candidate model against a baseline (`HistGradientBoosting`) on a chosen metric, returning a non-zero exit code on regression — so it drops straight into CI.
+and **gates** a candidate model against a baseline (`HistGradientBoosting`) on a chosen metric — **including `ece` and `log_loss`** — using the **paired per-fold delta**: both models are evaluated on identical folds, so the fold-wise difference is a paired sample, far less noisy than comparing two means. An optional `--max-ece` adds an absolute calibration ceiling. Non-zero exit code on regression — so it drops straight into CI.
 
 It uses [TabICL](https://github.com/soda-inria/tabicl) (a SOTA tabular foundation model) as the candidate model when installed; otherwise it runs baseline-only, which is still a valid calibration check. Everything runs offline.
 
@@ -35,7 +35,7 @@ pip install numpy "scikit-learn>=1.3" pandas
 pip install tabicl   # optional — enables the TabICL candidate model
 ```
 
-Python 3.10+. Feature columns must be numeric (encode categoricals first); the gate fails loud with a clear message otherwise.
+Python 3.10+. Feature columns must be numeric (encode categoricals first); the gate fails loud (exit `2`, clear message) otherwise — same for classes rarer than `--folds`, infinite values, and NaN when PCA would apply.
 
 ## Usage
 
@@ -60,31 +60,34 @@ Bundled datasets: `breast_cancer`, `wine`, `iris`, `digits`. The gate is multicl
 ```
 dataset: n=569, features=30, classes=2 | folds=5
 
-              accuracy  bal_acc  f1_macro  f1_weighted  log_loss  wall_s
+              accuracy  bal_acc  f1_macro  f1_weighted  log_loss    ece  wall_s
 model
-baseline_HGB    0.9701   0.9646    0.9677       0.9700    0.1047  2.71
-TabICL          0.9824   0.9802    0.9812       0.9824    0.0613  3.91
+baseline_HGB    0.9701   0.9646    0.9677       0.9700    0.1047 0.0288  1.3178
+TabICL          0.9824   0.9802    0.9812       0.9824    0.0613 0.0197  2.5185
 
 === calibration: TabICL ===
-mean confidence=0.976 | accuracy=0.982 | ECE=0.0090
+mean confidence=0.976 | accuracy=0.982 | ECE=0.0090 (pooled)
 share conf>0.99 = 82.6%
 reliability curve (confidence vs accuracy per bin):
   [0.6-0.7) n=   15  conf=0.645  acc=0.733  gap=+0.088
   [0.8-0.9) n=   17  conf=0.848  acc=1.000  gap=+0.152
   [0.9-1.0) n=  525  conf=0.995  acc=0.994  gap=-0.001
 
-[gate] f1_macro: TabICL=0.9812 vs baseline=0.9677 (delta=+0.0135, epsilon=0.0) -> PASS
+[gate] f1_macro: TabICL=0.9812 vs baseline_HGB=0.9677 (epsilon=0.0)
+[gate] paired delta per fold ('+' = candidate better): +0.0135 ± 0.0158 (min +0.0000, 5 folds) -> PASS
 ```
+
+(The table's `ece` column is the per-fold mean — the value the gate compares; the `--calibration` section shows the pooled-OOF ECE alongside the curve. They differ slightly by construction.)
 
 ## In CI
 
-The process exits `1` if the candidate (TabICL) fails the gate, `0` otherwise:
+Exit codes: **`0`** gate PASS (or baseline-only, no verdict) · **`1`** gate FAIL · **`2`** invalid input (non-numeric features, class rarer than `--folds`, NaN where PCA would apply, infinite values, all-NaN report) — bad data can never turn a CI job green.
 
 ```yaml
-- run: python calibration_gate.py --dataset breast_cancer --gate-metric f1_weighted --epsilon 0.0
+- run: python calibration_gate.py --csv data.csv --target label --gate-metric ece --max-ece 0.05 --require-candidate
 ```
 
-> If TabICL is **not** installed, the gate prints baseline-only and exits `0` (no verdict) — a CI job would pass green with no gate ever applied. Install `tabicl` in CI if you want the gate enforced.
+> If TabICL is **not** installed, the gate prints baseline-only and exits `0` (no verdict). Pass `--require-candidate` to make that case fail loud (exit `2`) instead — recommended in CI so a broken install can't pass silently.
 
 ## Options
 
@@ -93,12 +96,22 @@ The process exits `1` if the candidate (TabICL) fails the gate, `0` otherwise:
 | `--dataset` / `--csv` + `--target` | `breast_cancer` | data source (bundled or your CSV) |
 | `--n-pca` | `64` | PCA components when `n_features` exceeds it (`0` disables) |
 | `--folds` | `5` | stratified CV folds |
-| `--gate-metric` | `f1_macro` | metric the PASS/FAIL is decided on |
-| `--epsilon` | `0.0` | tolerance: candidate must be `>= baseline - epsilon` |
-| `--calibration` | off | print ECE + reliability curve |
+| `--gate-metric` | `f1_macro` | metric the PASS/FAIL is decided on: `f1_macro`, `f1_weighted`, `bal_acc`, `accuracy`, `log_loss`, `ece` (the last two gate lower-is-better) |
+| `--epsilon` | `0.0` | tolerance on the paired mean delta: candidate may be worse by up to epsilon |
+| `--max-ece` | off | absolute ceiling on the candidate's pooled ECE (second gate condition) |
+| `--require-candidate` | off | exit `2` when `tabicl` is missing instead of green baseline-only |
+| `--calibration` | off | print reliability curves (ECE is always computed and gateable) |
 | `--n-estimators` | `8` | TabICL ensemble size |
 | `--device` | auto | TabICL device (`mps`, `cpu`) |
 | `--random-state` | `42` | seed for reproducibility |
+
+## Tests
+
+```bash
+python -m pytest test_calibration_gate.py -q   # no tabicl needed (baseline-only path is forced)
+```
+
+Covers: ECE properties (perfectly calibrated → 0, over-confident → known value, bin weighting), gate direction for lower-is-better metrics, epsilon tolerance, `--max-ece` ceiling, and end-to-end exit codes (`0`/`2`) on the edge cases above.
 
 ## Background
 
